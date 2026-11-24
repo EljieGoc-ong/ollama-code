@@ -3,14 +3,16 @@
 Standard library only: msvcrt on Windows, termios on Linux/macOS. Falls back to input() where
 neither works (pipes, Git Bash's mintty), so suggestions are a bonus, never a requirement.
 """
+import _thread
 import codecs
 import contextlib
 import os
 import shutil
 import sys
+import threading
 import time
 
-from .terminal import ACCENT, IS_WINDOWS, TTY, dim, readline_safe, rgb, visible_len
+from .terminal import ACCENT, IS_WINDOWS, TTY, dim, readline_safe, rgb, screen, visible_len
 
 MAX_SUGGESTIONS = 8
 history = []
@@ -36,15 +38,112 @@ class Suggestions:
 
 NONE = Suggestions()
 
-_WIN_KEYS = {"H": "up", "P": "down", "K": "left", "M": "right", "G": "home", "O": "end", "S": "delete"}
+_WIN_KEYS = {"H": "up", "P": "down", "K": "left", "M": "right", "G": "home", "O": "end", "S": "delete",
+             "\x0f": "shift-tab"}
 _ESC_KEYS = {"A": "up", "B": "down", "D": "left", "C": "right", "H": "home", "F": "end",
-             "1~": "home", "7~": "home", "4~": "end", "8~": "end", "3~": "delete"}
+             "1~": "home", "7~": "home", "4~": "end", "8~": "end", "3~": "delete", "Z": "shift-tab"}
 
 
 def _windows_keys():
     while True:
         ch = msvcrt.getwch()
-        yield _WIN_KEYS.get(msvcrt.getwch(), "") if ch in ("\x00", "\xe0") else ch
+        if ch in ("\x00", "\xe0"):
+            yield _WIN_KEYS.get(msvcrt.getwch(), "")
+        else:
+            yield "esc" if ch == "\x1b" else ch
+
+
+class ModeSwitch(Exception):
+    """Shift+Tab at the prompt: the caller switches mode and re-asks, keeping what was typed."""
+
+    def __init__(self, text):
+        super().__init__(text)
+        self.text = text
+
+
+class EscWatcher:
+    """While the model works: Esc stops the turn (as Ctrl+C does), and anything else typed is kept
+    as type-ahead for the next prompt. Prompts that need the keyboard (approvals) pause it."""
+
+    def __init__(self):
+        self.fired, self.typed = False, ""
+        self._stop, self._pause, self._lock = threading.Event(), threading.Event(), threading.Lock()
+        self._saved, self._thread = None, None
+
+    def __enter__(self):
+        if AVAILABLE:
+            self._keys_mode()
+            screen.pause_keys = self.paused
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        if self._thread:
+            self._stop.set()
+            self._thread.join(1)
+            screen.pause_keys = None
+            self._normal_mode()
+        return False
+
+    @contextlib.contextmanager
+    def paused(self):
+        self._pause.set()
+        with self._lock:  # wait until the watcher isn't mid-read, so it can't steal the answer's keys
+            self._normal_mode()
+        try:
+            yield
+        finally:
+            self._keys_mode()
+            self._pause.clear()
+
+    def _keys_mode(self):
+        """Unix: keys arrive one by one and aren't echoed over the model's output. Ctrl+C still works."""
+        if IS_WINDOWS:
+            return
+        fd = sys.stdin.fileno()
+        self._saved = self._saved or termios.tcgetattr(fd)
+        mode = termios.tcgetattr(fd)
+        mode[3] &= ~(termios.ICANON | termios.ECHO)
+        mode[6][termios.VMIN], mode[6][termios.VTIME] = 1, 0
+        termios.tcsetattr(fd, termios.TCSADRAIN, mode)
+
+    def _normal_mode(self):
+        if self._saved is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved)
+
+    def _read_key(self):
+        if IS_WINDOWS:
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                msvcrt.getwch()  # arrows and function keys: ignored while the model works
+                return ""
+            return "esc" if ch == "\x1b" else ch
+        fd = sys.stdin.fileno()
+        ch = os.read(fd, 4).decode("utf-8", errors="ignore")
+        if ch.startswith("\x1b"):
+            if len(ch) > 1 or select.select([fd], [], [], 0.03)[0]:
+                os.read(fd, 32)  # rest of an arrow-key sequence, not a bare Esc
+                return ""
+            return "esc"
+        return ch
+
+    def _run(self):
+        while not self._stop.is_set():
+            if self._pause.is_set():
+                time.sleep(0.05)
+                continue
+            with self._lock:
+                if self._pause.is_set() or not _key_ready(0.1):
+                    continue
+                key = self._read_key()
+            if key == "esc" and not self.fired:
+                self.fired = True
+                _thread.interrupt_main()  # same path as Ctrl+C: the turn stops, the stream hangs up
+            elif key in ("\x08", "\x7f"):
+                self.typed = self.typed[:-1]
+            elif len(key) == 1 and key.isprintable():  # not "esc" again, nor a pasted control sequence
+                self.typed += key
 
 
 def _unix_keys():
@@ -125,13 +224,13 @@ def _key_ready(timeout):
     return bool(select.select([sys.stdin.fileno()], [], [], timeout)[0])
 
 
-def read_line(prompt, suggest, wake=None):
+def read_line(prompt, suggest, wake=None, initial=""):
     """input() with live suggestions. `suggest(buf, pos)` returns a Suggestions. While the line is
     empty, `wake()` is polled and raises Wake when it's true, so background work can take the turn
     without clobbering anything the user is typing."""
     if not AVAILABLE:
         return input(readline_safe(prompt))
-    view, buf, pos, sel, hidden, back = _View(prompt), "", 0, 0, False, 0
+    view, buf, pos, sel, hidden, back = _View(prompt), initial, len(initial), 0, False, 0
     keys = _windows_keys() if IS_WINDOWS else _unix_keys()
 
     def finish(text):
@@ -168,6 +267,11 @@ def read_line(prompt, suggest, wake=None):
             if key == "\x03":
                 finish(buf)
                 raise KeyboardInterrupt
+            if key == "shift-tab":
+                view.draw("", 0)
+                sys.stdout.write("\r\033[J")
+                sys.stdout.flush()
+                raise ModeSwitch(buf)
             if key in ("\x04", "\x1a") and not buf:
                 finish(buf)
                 raise EOFError

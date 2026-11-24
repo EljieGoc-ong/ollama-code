@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 
-from .terminal import (INTERACTIVE, bold, dim, out, screen, yellow)
-from .agent import (new_usage, system_prompt)
+from . import lineedit
+from .terminal import (INTERACTIVE, bold, dim, green, out, screen, yellow)
+from .agent import (describe, new_usage, system_prompt)
+from .tools import parse_args
 
 
 SESSIONS_DIR = Path(os.environ.get("OLLAMA_CODE_HOME") or Path.home() / ".ollama-code") / "sessions"
@@ -25,6 +27,7 @@ def save_session(state):
             "title": (prompts[0].strip().splitlines() or [""])[0][:80], "created": state.created,
             "updated": datetime.datetime.now().isoformat(timespec="seconds"),
             "usage": {**usage, "context": state.tokens},
+            "inputs": state.inputs[-MAX_INPUTS:],  # what was typed, /commands and !commands too: the ↑ history
             "messages": state.messages[1:]}  # the system prompt is rebuilt fresh on resume
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     path = SESSIONS_DIR / f"{state.session_id}.json"
@@ -50,14 +53,40 @@ def load_session(state, data):
     saved = data.get("usage", {})
     state.usage = {**new_usage(), **{k: v for k, v in saved.items() if k != "context"}}
     state.tokens = saved.get("context", 0)
+    state.inputs = list(data.get("inputs", []))
+    lineedit.history[:] = state.inputs  # ↑ brings back what was typed in this session
     prompts = sum(1 for m in data.get("messages", []) if m.get("role") == "user")
     out(dim(f"Resumed session {data['id']} · {prompts} prompts · last active {data.get('updated', '?')}"))
     if not _same_dir(data.get("cwd")):
         out(yellow(f"Note: this session was started in {data.get('cwd')}"))
-    recent = [m for m in data.get("messages", []) if m.get("role") in ("user", "assistant") and m.get("content")]
-    for m in recent[-6:]:
-        first = m["content"].strip().splitlines()[0][:150]
-        out(bold("> ") + first if m["role"] == "user" else dim(f"● {first}"))
+    for line in transcript(data.get("messages", []))[-REPLAY_LINES:]:
+        out(line)
+
+
+REPLAY_LINES = 14
+MAX_INPUTS = 500
+
+
+def transcript(messages):
+    """One line per event, for the replay on resume: prompts, your !commands, the model's tool calls
+    (commands it ran, files it edited) and its answers."""
+    lines = []
+    for m in messages:
+        text = (m.get("content") or "").strip()
+        if m.get("role") == "user" and text.startswith(BANG_PREFIX):
+            lines.append(bold("! ") + text[len(BANG_PREFIX):].lstrip("$ ").splitlines()[0][:150])
+        elif m.get("role") == "user" and text:
+            lines.append(bold("> ") + text.splitlines()[0][:150])
+        elif m.get("role") == "assistant":
+            if text:
+                lines.append(dim(f"● {text.splitlines()[0][:150]}"))
+            for call in m.get("tool_calls") or []:
+                fn = call.get("function") or {}
+                lines.append(green("● ") + dim(describe(fn.get("name", ""), parse_args(fn.get("arguments")))[:150]))
+    return lines
+
+
+BANG_PREFIX = "I ran this command myself:\n"
 
 
 def describe_session(i, s):

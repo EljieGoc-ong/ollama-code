@@ -11,10 +11,11 @@ from .terminal import (ACCENT, COLOR, TTY, bold, cyan, dim, gradient, green, out
 from . import automation, extensions, lineedit, mcp, schedule, tasks
 from .attach import attachments, match_files, project_files
 from .lineedit import Suggestions
-from .tools import (_clip, run_command)
+from . import shells
+from .tools import _clip, wait_for
 from .client import OllamaError, loaded_model, preload
 from .agent import (State, compact, footer, repair_history, run_turn, show_usage)
-from .sessions import _same_dir, list_sessions, load_session, resume, save_session
+from .sessions import BANG_PREFIX, _same_dir, list_sessions, load_session, resume, save_session
 
 VERSION = "0.3.0"
 DEFAULT_MODEL = "glm-4.7-flash"
@@ -33,17 +34,20 @@ COMMANDS = [  # (command, arguments, what it does): drives /help and the live su
     ("/skills", "", "list the Claude Code skills found (run one with /<skill> [request])"),
     ("/agents", "", "list the Claude Code agents the model can delegate to"),
     ("/tasks", "[stop n|all]", "background agents: list them, or stop one"),
+    ("/shells", "[n|stop n|all]", "background commands: list, show one's output, or stop them"),
     ("/goal", "<objective>", "keep working until the objective is done (/goal clear, /goal continue)"),
     ("/loop", "[interval] <prompt>", "repeat a prompt now and every interval, default 10m (/loop stop)"),
     ("/schedule", "in|at|every <when> <prompt>", "run a prompt later, e.g. at 9am (/schedule cancel n|all)"),
     ("/think", "", "toggle showing the model's reasoning (shown by default)"),
+    ("/auto", "", "toggle auto mode: no approvals, the model decides without asking (also Shift+Tab)"),
     ("/yolo", "", "toggle asking before edits and commands"),
     ("/exit", "", "quit (also Ctrl+D, or Ctrl+Z then Enter on Windows)"),
 ]
 HELP = "Commands:\n" + "\n".join(f"  {(c + ' ' + a).strip():<17}{d}" for c, a, d in COMMANDS) + """
   !<command>       run a shell command yourself; its output is added to the conversation
   @path            attach a file (type @ for suggestions, or drag a file into the terminal)
-End a line with \\ to keep typing on the next line. Ctrl+C stops the current response."""
+End a line with \\ to keep typing on the next line. Esc (or Ctrl+C) stops the current response;
+anything you type meanwhile waits at the next prompt. Shift+Tab switches auto mode on and off."""
 
 
 class Suggester:
@@ -106,6 +110,8 @@ def handle_command(state, text):
     elif cmd == "/think":
         state.show_thinking = not state.show_thinking
         out(dim(f"Showing reasoning: {'on' if state.show_thinking else 'off'}"))
+    elif cmd == "/auto":
+        set_auto(state, not state.auto)
     elif cmd == "/yolo":
         state.yolo = not state.yolo
         out(dim(f"Ask before edits and commands: {'off' if state.yolo else 'on'}"))
@@ -123,6 +129,8 @@ def handle_command(state, text):
         automation.schedule_command(arg)
     elif cmd == "/tasks":
         automation.tasks_command(arg)
+    elif cmd == "/shells":
+        automation.shells_command(arg)
     elif cmd == "/goal":
         automation.goal_command(state, arg, run_prompt)
     else:
@@ -156,15 +164,37 @@ def with_files(prompt):
 
 
 def work_waiting():
-    return schedule.has_due() or tasks.has_finished()
+    return schedule.has_due() or tasks.has_finished() or shells.has_finished()
 
 
-def read_prompt():
+AUTO_COLOR = (255, 170, 60)
+typeahead = ""  # what was typed while the model worked, waiting for the next prompt
+
+
+def prompt_marker(state):
+    return (rgb("⏵⏵ auto ", AUTO_COLOR, "1;") if state.auto else "") + rgb("❯ ", ACCENT[0], "1;")
+
+
+def set_auto(state, on):
+    state.auto = on
+    out(rgb("⏵⏵ auto mode on", AUTO_COLOR, "1;") + dim(" · no approval prompts, the model decides without "
+                                                         "asking · Shift+Tab or /auto to turn off")
+        if on else dim("Auto mode off · edits and commands ask first again"))
+
+
+def read_prompt(state):
+    global typeahead
     lines, suggest = [], Suggester()
     while True:
         wake = None if lines else work_waiting  # never interrupt a half-typed multi-line prompt
-        line = screen.ask(rgb("❯ ", ACCENT[0], "1;") if not lines else dim("┊ "),
-                          reader=lambda prompt: lineedit.read_line(prompt, suggest, wake))
+        initial, typeahead = typeahead, ""
+        try:
+            line = screen.ask(prompt_marker(state) if not lines else dim("┊ "),
+                              reader=lambda prompt: lineedit.read_line(prompt, suggest, wake, initial))
+        except lineedit.ModeSwitch as switch:  # Shift+Tab: flip auto mode, keep the text
+            set_auto(state, not state.auto)
+            typeahead = switch.text
+            continue
         if line.endswith("\\"):
             lines.append(line[:-1])
             continue
@@ -172,16 +202,44 @@ def read_prompt():
         return "\n".join(lines).strip()
 
 
+BANG_WAIT = 5  # seconds a !command holds the prompt before it moves to the background
+
+
 def run_bang(state, command):
     screen.new_turn()
     screen.set_status("Running")
+    shell = shells.start(command, owner="user")
     try:
-        result = run_command(command)
+        finished = wait_for(shell, BANG_WAIT)
+    except KeyboardInterrupt:
+        shell.stop()
+        finished = True
     finally:
         screen.set_status(None)
+    if finished:
+        return record_bang(state, shell)
+    shell.backgrounded = True
+    out(dim(f"  ⎿  Still running as shell #{shell.id}, so you can carry on. "
+            f"/shells {shell.id} shows its output, /shells stop {shell.id} ends it."))
+
+
+def record_bang(state, shell):
+    result = shell.result()
     out(dim(result))
-    state.messages.append({"role": "user", "content": f"I ran this command myself:\n$ {command}\n{_clip(result)}"})
+    state.messages.append({"role": "user", "content": f"{BANG_PREFIX}$ {shell.command}\n{_clip(result)}"})
     save_session(state)
+
+
+def record_unfinished_shells(state):
+    """At exit, background commands get stopped. Keep what they printed in the session first."""
+    for s in shells.shells.values():
+        if s.running:
+            s.delivered = True  # recorded here; the usual "finished" report must not repeat it
+            s.stop()
+            who = BANG_PREFIX if s.owner == "user" else f"[Background command shell #{s.id} that you started]\n"
+            state.messages.append({"role": "user", "content": (
+                f"{who}$ {s.command}\n(still running when the session ended, so it was stopped; "
+                f"output so far:)\n{_clip(s.text())}")})
 
 
 def guarded(state, action):
@@ -252,7 +310,9 @@ def banner(state):
     box([("model", bold(state.model) + "  " + status),
          ("host", dim(state.host)),
          ("cwd", cwd),
-         ("mode", yellow("yolo, tools run without asking") if state.yolo else "asks before edits and commands")]
+         ("mode", rgb("auto: no approvals, no questions", AUTO_COLOR) if state.auto
+          else yellow("yolo, tools run without asking") if state.yolo
+          else "asks before edits and commands · Shift+Tab for auto")]
         + ([("mcp", f"{len(mcp.servers)} server{'s' * (len(mcp.servers) != 1)} starting · /mcp for status")]
            if mcp.servers else [])
         + ([("claude", f"{len(extensions.skills)} skills · {len(extensions.agents)} agents · /skills /agents")]
@@ -262,8 +322,16 @@ def banner(state):
 
 
 def run_prompt(state, text, files=()):
-    """One model turn with the usual footer. False if it was interrupted or failed."""
-    ok = guarded(state, lambda: run_turn(state, text, files))
+    """One model turn with the usual footer. False if it was interrupted (Esc / Ctrl+C) or failed."""
+    global typeahead
+    try:
+        with lineedit.EscWatcher() as keys:
+            ok = guarded(state, lambda: run_turn(state, text, files))
+    except KeyboardInterrupt:  # an Esc that landed just after the turn ended: nothing left to stop
+        ok = False
+    typeahead += keys.typed
+    if keys.fired:
+        out(dim("  ⎿  Stopped with Esc. Type what to do instead, or carry on."))
     if ok:
         footer(state)
     out()
@@ -286,6 +354,12 @@ def process(state, text):
 
 def run_due_work(state):
     """Run scheduled jobs and hand finished background reports to the model. False means quit."""
+    for shell in shells.take_finished():
+        out(green("● ") + bold(f"shell #{shell.id} finished (exit {shell.code})") + dim(f" · {shell.command}"))
+        if shell.owner == "user":
+            record_bang(state, shell)
+        else:
+            run_prompt(state, automation.shell_notice(shell))
     for header, prompt, from_user in automation.due_work():
         out(header)
         if from_user:
@@ -303,7 +377,7 @@ def repl(state):
         if not run_due_work(state):
             return
         try:
-            text = read_prompt()
+            text = read_prompt(state)
             ctrl_c_once = False
         except lineedit.Wake:
             continue
@@ -317,8 +391,10 @@ def repl(state):
             ctrl_c_once = True
             out(dim("\n(press Ctrl+C again or type /exit to quit)"))
             continue
-        if text and not process(state, text):
-            return
+        if text:
+            state.inputs.append(text)
+            if not process(state, text):
+                return
 
 
 def main(argv=None):
@@ -333,6 +409,9 @@ def main(argv=None):
     ap.add_argument("--no-think", action="store_true", help="turn off the model's reasoning step (faster)")
     ap.add_argument("--hide-thinking", action="store_true", help="don't print the model's reasoning as it streams")
     ap.add_argument("--yolo", action="store_true", help="run edits and commands without asking")
+    ap.add_argument("--auto", action="store_true",
+                    help="auto mode: no approval prompts at all, and the model decides instead of asking you "
+                         "(toggle in the app with Shift+Tab or /auto)")
     ap.add_argument("--no-claude", action="store_true",
                     help="don't load Claude Code skills and agents from .claude folders and plugins")
     ap.add_argument("-p", "--print", dest="prompt", metavar="PROMPT",
@@ -348,6 +427,7 @@ def main(argv=None):
     if not args.no_claude:
         extensions.load()  # before State: the system prompt lists them
     state = State(args.model, host, args.ctx, not args.no_think, not args.hide_thinking, args.yolo)
+    state.auto = args.auto
     mcp.start_all()
     if args.cont:
         here = [s for s in list_sessions() if _same_dir(s.get("cwd"))]
@@ -359,6 +439,7 @@ def main(argv=None):
         resume(state, args.resume)
     if args.prompt is not None:
         mcp.wait_until_started()
+        shells.FOREGROUND_WAIT = 600  # one-shot: no prompt to give back, so let commands finish in place
         files = with_files(args.prompt)
         if not guarded(state, lambda: run_turn(state, args.prompt, files)):
             return 1
@@ -371,6 +452,28 @@ def main(argv=None):
             if not run_prompt(state, prompt):
                 return 1
         return 0
-    repl(state)
+    try:
+        repl(state)
+    except KeyboardInterrupt:  # Ctrl+C somewhere outside a turn: still leave cleanly
+        pass
+    finally:
+        goodbye(state)
     return 0
+
+
+def goodbye(state):
+    """On the way out: make sure the session is saved, then say how to pick it up again."""
+    record_unfinished_shells(state)
+    prompts = [m["content"] for m in state.messages if m["role"] == "user"]
+    if not prompts:
+        return out(dim("Bye."))
+    try:
+        save_session(state)
+    except OSError as e:
+        return out(yellow(f"Couldn't save the session: {e}"))
+    title = (prompts[0].strip().splitlines() or [""])[0][:60]
+    out()
+    out(dim("Session saved ") + bold(state.session_id) + dim(f" · {title}"))
+    out(dim("Resume it with  ") + cyan(f"ollama-code --resume {state.session_id}"))
+    out(dim("            or  ") + cyan("ollama-code -c") + dim("  (latest session in this folder)"))
 

@@ -49,6 +49,7 @@ ollama-code --yolo -p "fix the failing test in tests/test_api.py"
 | `--no-think` | | thinking on | Turn off the model's reasoning step (faster) |
 | `--hide-thinking` | | shown | Don't print the reasoning as it streams |
 | `--yolo` | | off | Run edits and commands without asking |
+| `--auto` | | off | Auto mode: no approval prompts at all, and the model decides instead of asking you |
 | `-p PROMPT` | | | Run one prompt and exit |
 | `-c, --continue` | | | Continue the most recent session from this folder |
 | `-r, --resume [ID]` | | | Resume a session by id (or its first characters), or pick from a list |
@@ -72,7 +73,8 @@ ollama-code --yolo -p "fix the failing test in tests/test_api.py"
 | `!command` | Run a shell command yourself; output goes into the conversation |
 | `@path` | Attach a file. Type `@` for suggestions, or drag a file into the terminal (absolute paths attach too). Images go to vision models |
 | line ending in `\` | Continue typing on the next line |
-| Ctrl+C | Stop the current response |
+| Esc or Ctrl+C | Stop the current response (and the command it's running). Keys typed while the model works wait at the next prompt |
+| Shift+Tab, `/auto` | Switch auto mode on/off. The prompt shows `⏵⏵ auto` while it's on |
 
 Typing `/` shows matching commands as you type (arrows to pick, Tab to complete, Enter to run, Esc to hide).
 
@@ -94,6 +96,32 @@ Agents can also run **in the background**: the model passes `background: true`, 
 the agent's report arrives as a message when it's done. Background agents can't ask for approval, so tools that
 need it are refused unless you use `--yolo` or answered "always" for that tool earlier. `/tasks` lists them,
 `/tasks stop <n|all>` stops them.
+
+## Web search and fetch
+
+Built in, no extra installs. The model searches with `web_search` and reads pages with `web_fetch`, which
+returns the page's readable text (the `<main>`/article part when there is one) plus its links. JavaScript
+doesn't run, so pages built entirely in the browser come back thin.
+
+- Search runs without asking. Fetch asks once per website; "always" approves that site for the session.
+- Search backend, first one configured wins:
+
+| Env var | Backend |
+|---|---|
+| `OLLAMA_API_KEY` | Ollama's web search API (free key at ollama.com/settings/keys). Most reliable |
+| `OLLAMA_CODE_SEARXNG` | Your SearXNG instance, e.g. `http://localhost:8888` (JSON format enabled) |
+| (none) | DuckDuckGo, no key. Fine for occasional searches; bursts can trigger its bot check for a while |
+
+Claude Code agents that list `WebSearch` / `WebFetch` in their `tools:` get these tools.
+
+## Long-running commands
+
+Commands never lock up the app. When the model's `run_command` is still going after 30 seconds (or it asks for
+`background` straight away, e.g. for a dev server), it keeps running in the background, the model carries on, and
+the result arrives as a message when the command ends. The model can check one with `shell_output` or end it with
+`stop_shell`. Your own `!commands` move to the background after 5 seconds, so you get the prompt back.
+`/shells` lists them, `/shells <n>` shows one's output, `/shells stop <n|all>` ends them. Background commands are
+stopped when ollama-code exits. In `-p` mode commands simply run to completion (up to 10 minutes).
 
 ## Loops, schedules and goals
 

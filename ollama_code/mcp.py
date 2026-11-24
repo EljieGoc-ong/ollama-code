@@ -79,11 +79,14 @@ class Server:
         with self.lock:  # ponytail: one request at a time per server, fine for a single agent
             self.next_id += 1
             self._send({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": params})
+            deadline = time.monotonic() + timeout
             while True:
                 try:
-                    msg = self.replies.get(timeout=timeout)
+                    msg = self.replies.get(timeout=0.2)  # short slices: Esc / Ctrl+C get through on Windows
                 except queue.Empty:
-                    raise McpError(f"{self.name} didn't answer {method} within {timeout}s") from None
+                    if time.monotonic() > deadline:
+                        raise McpError(f"{self.name} didn't answer {method} within {timeout}s") from None
+                    continue
                 if msg is None:
                     raise McpError(f"{self.name} exited")
                 if msg.get("id") == self.next_id:

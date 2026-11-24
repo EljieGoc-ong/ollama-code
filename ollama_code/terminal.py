@@ -1,4 +1,5 @@
 """Terminal output: colors, terminal detection and the live status line."""
+import contextlib
 import itertools
 import os
 import re
@@ -134,6 +135,7 @@ class Screen:
         self.turn_tokens = 0            # tokens streamed so far this turn
         self.step_tokens, self.step_first, self.step_last = 0, 0.0, 0.0  # for the live tok/s
         self.live = live
+        self.pause_keys = None          # set by the Esc watcher: a context that hands the keyboard back
         self.pinned = None              # label of an animated header line above the cursor, e.g. "Thinking"
         self.pin_start = 0.0
         self.rows_below = self.col = 0  # rows printed since the pinned header, and the cursor column
@@ -213,7 +215,7 @@ class Screen:
             parts.append(f"↓ {self.turn_tokens:,} tokens")
         if self.step_tokens > 1 and self.step_last > self.step_first:
             parts.append(f"{(self.step_tokens - 1) / (self.step_last - self.step_first):.1f} tok/s")
-        return " · ".join(parts + ["Ctrl+C to interrupt"])
+        return " · ".join(parts + ["Esc to interrupt" if self.pause_keys else "Ctrl+C to interrupt"])
 
     def set_status(self, text):
         with self.lock:
@@ -232,7 +234,8 @@ class Screen:
             self.pinned = None  # the prompt would scroll it anyway
             sys.stdout.flush()
         try:
-            return reader(prompt) if reader else input(readline_safe(prompt))
+            with self.pause_keys() if self.pause_keys else contextlib.nullcontext():
+                return reader(prompt) if reader else input(readline_safe(prompt))
         finally:
             with self.lock:
                 self.line_start, self.last_write = True, time.monotonic()

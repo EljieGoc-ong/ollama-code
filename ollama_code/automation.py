@@ -1,5 +1,5 @@
 """/loop, /schedule, /tasks and /goal: work that runs without a fresh prompt from the user."""
-from . import schedule, tasks
+from . import schedule, shells, tasks
 from .terminal import ACCENT, bold, dim, green, out, red, rgb, yellow
 
 MAX_GOAL_ROUNDS = 20  # model turns /goal spends before checking back with the user
@@ -51,6 +51,26 @@ def tasks_command(arg):
     for t in tasks.tasks.values():
         mark = {"running": yellow("◌"), "done": green("●"), "stopped": dim("■")}.get(t.status, red("✗"))
         out(f"  {mark} {tasks.describe(t)}")
+
+
+def shells_command(arg):
+    if arg.startswith("stop"):
+        n = shells.stop((arg.split() + ["all"])[1])
+        return out(dim(f"Stopped {n} command{'s' * (n != 1)}."))
+    if arg:
+        s = shells.find(arg)
+        return out(dim(s.describe()) + "\n" + s.text(tail=6000)) if s else out(yellow(f"No shell {arg}."))
+    if not shells.shells:
+        return out(dim("No background commands. Long commands move here by themselves; !cmd ones after 5s."))
+    for s in shells.shells.values():
+        out(f"  {yellow('◌') if s.running else green('●') if s.code == 0 else red('✗')} {s.describe()}")
+
+
+def shell_notice(shell):
+    """The message that hands a finished background command's result to the model."""
+    return (f"[Background command shell #{shell.id} finished. This is its result, not a message from the user.]\n"
+            f"$ {shell.command}\n{shell.result()[-8000:]}\n\n"
+            "Use this if it matters for what we're doing; otherwise just tell the user briefly how it went.")
 
 
 def due_work():

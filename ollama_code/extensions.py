@@ -16,10 +16,10 @@ from pathlib import Path
 CLAUDE_HOME = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 CATALOG_CHARS = 12_000  # past this, the system prompt lists names only, to spare small context windows
 
-# Claude Code tool names -> ours. Tools we don't have (WebFetch, Task, ...) are dropped.
+# Claude Code tool names -> ours. Tools we don't have (Task, TodoWrite, ...) are dropped.
 CLAUDE_TOOLS = {"Read": "read_file", "Write": "write_file", "Edit": "edit_file", "MultiEdit": "edit_file",
                 "NotebookEdit": "edit_file", "Glob": "list_files", "LS": "list_files", "Grep": "grep",
-                "Bash": "run_command", "PowerShell": "run_command"}
+                "Bash": "run_command", "PowerShell": "run_command", "WebSearch": "web_search", "WebFetch": "web_fetch"}
 
 skills, agents = {}, {}  # name -> {"name", "description", "path", "tools"}
 

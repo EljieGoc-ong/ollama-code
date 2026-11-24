@@ -3,8 +3,10 @@ import fnmatch
 import json
 import os
 import re
-import subprocess
+import time
 from pathlib import Path
+
+from . import shells, web
 
 MAX_TOOL_OUTPUT = 30_000  # chars of tool output sent back to the model
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
@@ -109,16 +111,53 @@ def grep(pattern, path=".", glob=None, ignore_case=False):
     return "\n".join(hits) or "No matches."
 
 
-def run_command(command, timeout=120):
-    try:
-        r = subprocess.run(command, shell=True, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=float(timeout), stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        return f"Error: command timed out after {timeout}s"
-    body = (r.stdout or "").rstrip()
-    if r.stderr and r.stderr.strip():
-        body += "\n[stderr]\n" + r.stderr.rstrip()
-    return f"exit code {r.returncode}\n{body}".rstrip()
+def wait_for(shell, seconds):
+    """Wait for a command in short slices so Ctrl+C is noticed on every platform."""
+    deadline = time.monotonic() + float(seconds)
+    while not shell.done.wait(0.2):
+        if time.monotonic() > deadline:
+            return False
+    return True
+
+
+def run_command(command, timeout=None, background=False):
+    """Run a command; if it's still going after `timeout` seconds (or background is set) it keeps
+    running in the background and its result is reported when it ends."""
+    timeout = shells.FOREGROUND_WAIT if timeout is None else timeout
+    shell = shells.start(command)
+    if not _truthy(background):
+        try:
+            finished = wait_for(shell, timeout)
+        except KeyboardInterrupt:
+            shell.stop()
+            raise
+        if finished:
+            return shell.result()
+    shell.backgrounded = True
+    so_far = shell.text(tail=2000)
+    why = "" if _truthy(background) else f" (still going after {timeout}s)"
+    return (f"Running in the background as shell #{shell.id}{why}. Its result arrives as a message when it "
+            "ends; meanwhile carry on, check it with shell_output or end it with stop_shell."
+            + (f"\nOutput so far:\n{so_far}" if so_far else ""))
+
+
+def shell_output(shell, tail=4000):
+    s = shells.find(shell)
+    if not s:
+        return f"Error: no shell #{shell}. Running ones: {', '.join(str(i) for i in shells.shells) or 'none'}"
+    status = "still running" if s.running else f"finished with exit code {s.code}"
+    return f"shell #{s.id} {status}: {s.command}\n{s.text(tail=int(tail))}".rstrip()
+
+
+def stop_shell(shell):
+    s = shells.find(shell)
+    if not s:
+        return f"Error: no shell #{shell}."
+    if not s.running:
+        return f"shell #{s.id} had already finished with exit code {s.code}."
+    s.delivered = True  # the model asked for this; no need to report the end
+    s.stop()
+    return f"Stopped shell #{s.id}.\n{s.text(tail=2000)}".rstrip()
 
 
 def _p(kind, description):
@@ -155,10 +194,30 @@ TOOLS = {
         "ignore_case": _p("boolean", "Case-insensitive search (default false)"),
     }, ["pattern"], False),
     "run_command": (run_command, "Run a shell command in the working directory and return its exit code "
-                                 "and output. Not interactive: stdin is closed.", {
+                                 "and output. Not interactive: stdin is closed. Commands that take longer than "
+                                 "`timeout` seconds keep running in the background and report back when done; "
+                                 "set background for servers, watchers and long builds.", {
         "command": _p("string", "The command line to run"),
-        "timeout": _p("integer", "Seconds before the command is stopped (default 120)"),
+        "timeout": _p("integer", f"Seconds to wait before moving it to the background "
+                                 f"(default {shells.FOREGROUND_WAIT})"),
+        "background": _p("boolean", "Start it in the background right away (default false)"),
     }, ["command"], True),
+    "web_search": (web.web_search, "Search the web. Returns titles, URLs and snippets.", {
+        "query": _p("string", "What to search for"),
+        "count": _p("integer", "How many results (default 8)"),
+    }, ["query"], False),
+    "web_fetch": (web.web_fetch, "Fetch a web page (or any URL) and return its readable text and its links. "
+                                 "JavaScript doesn't run, so script-built pages may come back thin.", {
+        "url": _p("string", "The URL to read"),
+        "max_chars": _p("integer", "Most characters of page text to return (default 20000)"),
+    }, ["url"], True),
+    "shell_output": (shell_output, "Show the latest output and status of a background command.", {
+        "shell": _p("integer", "Shell number from run_command"),
+        "tail": _p("integer", "How many characters of the most recent output to return (default 4000)"),
+    }, ["shell"], False),
+    "stop_shell": (stop_shell, "Stop a background command (and anything it started).", {
+        "shell": _p("integer", "Shell number from run_command"),
+    }, ["shell"], False),
 }
 
 TOOL_SCHEMAS = [
