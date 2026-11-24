@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollama-code"
+version = "0.3.0"
+description = "A small Claude-Code-style coding agent for the terminal, powered by Ollama"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+ollama-code = "ollama_code.cli:main"
+
+[tool.setuptools]
+packages = ["ollama_code"]
