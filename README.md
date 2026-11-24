@@ -90,6 +90,24 @@ Skills and agents you set up for Claude Code work here too. They're read from `.
 
 Every agent runs on the current Ollama model; a `model:` line (sonnet, opus…) is ignored.
 
+Agents can also run **in the background**: the model passes `background: true`, keeps working with you, and
+the agent's report arrives as a message when it's done. Background agents can't ask for approval, so tools that
+need it are refused unless you use `--yolo` or answered "always" for that tool earlier. `/tasks` lists them,
+`/tasks stop <n|all>` stops them.
+
+## Loops, schedules and goals
+
+| Command | What it does |
+|---|---|
+| `/loop [interval] <prompt>` | Run a prompt now and then every interval (`30s`, `5m`, `1h30m`; default `10m`). `/loop` lists, `/loop stop [n]` ends |
+| `/schedule in 10m <prompt>` | Run once after a delay. Also `at 14:30` / `at 9am`, and `every 2h` |
+| `/schedule` | List jobs; `/schedule cancel <n\|all>` removes them |
+| `/goal <objective>` | Keep working turn after turn until the model calls `goal_complete` (up to 20 rounds; Ctrl+C pauses). `/goal continue`, `/goal clear` |
+
+Prompts can be anything you'd type, including skills: `/loop 30m /impeccable audit the dashboard`.
+Jobs fire when the prompt is empty (never over something you're typing) and only while ollama-code is
+open; for jobs that must survive a restart, run `ollama-code -p "..."` from cron or Task Scheduler.
+
 ## MCP servers
 
 Stdio MCP servers in `.mcp.json` (project) or `~/.ollama-code/mcp.json` (user) start with the app, and their

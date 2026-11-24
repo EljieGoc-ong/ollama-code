@@ -8,6 +8,7 @@ import contextlib
 import os
 import shutil
 import sys
+import time
 
 from .terminal import ACCENT, IS_WINDOWS, TTY, dim, readline_safe, rgb, visible_len
 
@@ -109,8 +110,25 @@ class _View:
         sys.stdout.flush()
 
 
-def read_line(prompt, suggest):
-    """input() with live suggestions. `suggest(buf, pos)` returns a Suggestions."""
+class Wake(Exception):
+    """Raised by read_line when `wake()` says something is waiting (a due job, a finished task)."""
+
+
+def _key_ready(timeout):
+    if IS_WINDOWS:
+        deadline = time.monotonic() + timeout
+        while not msvcrt.kbhit():
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.02)
+        return True
+    return bool(select.select([sys.stdin.fileno()], [], [], timeout)[0])
+
+
+def read_line(prompt, suggest, wake=None):
+    """input() with live suggestions. `suggest(buf, pos)` returns a Suggestions. While the line is
+    empty, `wake()` is polled and raises Wake when it's true, so background work can take the turn
+    without clobbering anything the user is typing."""
     if not AVAILABLE:
         return input(readline_safe(prompt))
     view, buf, pos, sel, hidden, back = _View(prompt), "", 0, 0, False, 0
@@ -126,6 +144,12 @@ def read_line(prompt, suggest):
             hint = NONE if hidden else suggest(buf, pos)
             sel = min(sel, max(len(hint.items) - 1, 0))
             view.draw(buf, pos, hint.items, sel)
+            while wake and not _key_ready(0.25):
+                if not buf and wake():
+                    view.draw("", 0)
+                    sys.stdout.write("\r\033[J")  # remove the empty prompt; it's redrawn afterwards
+                    sys.stdout.flush()
+                    raise Wake()
             key = next(keys)
             if hint.items and key in ("\t", "\r", "\n"):
                 pick = hint.items[sel][0]

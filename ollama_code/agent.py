@@ -12,7 +12,7 @@ import copy
 
 from . import extensions, mcp
 from .attach import build_message
-from .tools import (TOOL_SCHEMAS, TOOLS, _clip, execute_tool, parse_args)
+from .tools import (TOOL_SCHEMAS, TOOLS, _clip, _truthy, execute_tool, parse_args)
 from .client import OllamaError, loaded_context, loaded_model, stream_chat
 
 MAX_STEPS = 50  # model calls per user turn, a guard against tool-call loops
@@ -25,6 +25,10 @@ LABEL_KEY = {"read_file": "path", "write_file": "path", "edit_file": "path",
 
 
 def describe(name, args):
+    if name == "goal_complete":
+        return "Goal " + ("blocked" if _truthy(args.get("blocked")) else "complete")
+    if name == "run_agent" and _truthy(args.get("background")):
+        return f"Agent({args.get('agent', '')}) in the background"
     if name == "use_skill":
         return f"Skill({args.get('name', '')})"
     if name == "run_agent":
@@ -108,6 +112,9 @@ class State:
         self.always = set()
         self.subagent = None  # name of the agent when this state runs a sub-agent
         self.allowed = None   # tool names this state may use; None means all
+        self.background = None  # threading.Event that stops a background agent; None in the foreground
+        self.goal = None      # objective /goal is working toward; cleared by the goal_complete tool
+        self.goal_result = None  # (summary, blocked) from goal_complete
         self.tokens = 0  # context used by the last request: prompt + reply
         self.turn = new_usage()
         self.start_session()
@@ -149,27 +156,43 @@ How to work:
     return text + (extensions.catalog() if with_catalog else "")
 
 
+GOAL_COMPLETE = {"type": "function", "function": {
+    "name": "goal_complete",
+    "description": "Call when the current goal is fully done and verified, or when you are blocked and need the user.",
+    "parameters": {"type": "object", "required": ["summary"], "properties": {
+        "summary": {"type": "string", "description": "What was achieved, or what you need from the user"},
+        "blocked": {"type": "boolean", "description": "True if you stopped because you need the user"}}}}}
+
+
 def tool_schemas(state):
-    schemas = TOOL_SCHEMAS + mcp.schemas() + ([] if state.subagent else extensions.schemas())
+    schemas = TOOL_SCHEMAS + mcp.schemas()
+    if not state.subagent:
+        schemas += extensions.schemas() + ([GOAL_COMPLETE] if state.goal else [])
     if state.allowed is None:
         return schemas
     return [s for s in schemas if s["function"]["name"] in state.allowed]
 
 
-def run_agent(state, name, task):
-    """Run a Claude Code agent as a sub-agent: its own system prompt, a fresh conversation, limited tools.
-    Returns its final answer. Sub-agents can't start further agents."""
-    try:
-        prompt, spec = extensions.agent_prompt(name)
-    except LookupError as e:
-        return str(e)
+def make_subagent(state, name, task):
+    """A State for a Claude Code agent: its own system prompt, a fresh conversation, limited tools.
+    Sub-agents can't start further agents. LookupError if there's no such agent."""
+    prompt, spec = extensions.agent_prompt(name)
     child = copy.copy(state)  # shares approvals and usage totals with the parent
-    child.subagent, child.show_thinking = name, False
+    child.subagent, child.show_thinking, child.goal = name, False, None
     child.allowed = set(extensions.allowed_tools(spec, [s["function"]["name"] for s in tool_schemas(child)]))
     child.messages = [{"role": "system", "content": system_prompt(with_catalog=False)
                        + f"\n\nYou are running as the '{name}' agent. Finish with a complete report: it is the "
                          "only thing the caller sees.\n\n" + prompt},
                       {"role": "user", "content": task}]
+    return child
+
+
+def run_agent(state, name, task):
+    """Run an agent in the foreground and return its final report."""
+    try:
+        child = make_subagent(state, name, task)
+    except LookupError as e:
+        return str(e)
     return agent_loop(child) or "(the agent finished without a report)"
 
 
@@ -187,6 +210,8 @@ def _stream_reply(state):
                "stream": True, "think": state.think}
     if state.ctx:
         payload["options"] = {"num_ctx": state.ctx}
+    if state.background:
+        return _read_quietly(state, payload)
     loaded = loaded_model(state)
     screen.set_status(f"Loading {state.model} into memory" if loaded == {} else f"Waiting for {state.model}")
     screen.new_step()
@@ -195,6 +220,27 @@ def _stream_reply(state):
         return _read_stream(state, payload, started)
     finally:
         done_thinking(started)
+
+
+class Stopped(Exception):
+    """A background agent was told to stop."""
+
+
+def _read_quietly(state, payload):
+    """_read_stream for background agents: same reply, nothing touches the screen."""
+    content, calls, stats = [], [], {}
+    for chunk in stream_chat(state.host, payload):
+        if state.background.is_set():
+            raise Stopped()
+        msg = chunk.get("message") or {}
+        content.append(msg.get("content") or "")
+        calls.extend(msg.get("tool_calls") or [])
+        if chunk.get("done"):
+            stats = chunk
+    reply = {"role": "assistant", "content": "".join(content)}
+    if calls:
+        reply["tool_calls"] = calls
+    return reply, stats
 
 
 def done_thinking(started):
@@ -267,6 +313,8 @@ def model_reply(state):
 def run_tool_call(state, call):
     fn = call.get("function") or {}
     name, args = fn.get("name", ""), parse_args(fn.get("arguments"))
+    if state.background:
+        return state.messages.append({"role": "tool", "tool_name": name, "content": background_tool(state, name, args)})
     new_line()
     out((dim(f"  ↳ {state.subagent} ") if state.subagent else "") + green("● ") + bold(describe(name, args)))
     if name in ("write_file", "edit_file"):
@@ -283,12 +331,32 @@ def run_tool_call(state, call):
     state.messages.append({"role": "tool", "tool_name": name, "content": result})
 
 
+def background_tool(state, name, args):
+    """A background agent's tool call: no screen, and no one to ask, so risky tools need --yolo or an
+    earlier "always" from the user."""
+    if state.allowed is not None and name not in state.allowed:
+        return f"Error: the '{state.subagent}' agent isn't allowed to use {name}."
+    risky = TOOLS[name][4] if name in TOOLS else bool(mcp.owner(name)) and mcp.needs_approval(name)
+    if risky and not state.yolo and name not in state.always:
+        return (f"Error: {name} needs the user's approval, which a background agent can't ask for. "
+                "Do what you can without it and say in your report what still needs doing.")
+    return call_tool(state, name, args)
+
+
 def call_tool(state, name, args):
     if name == "use_skill" and not state.subagent:
         return _clip(extensions.skill_text(str(args.get("name", ""))))
     if name == "run_agent" and not state.subagent:
-        screen.set_status(f"{args.get('agent', 'agent')} working")
-        return _clip(run_agent(state, str(args.get("agent", "")), str(args.get("task", ""))))
+        agent_name, task = str(args.get("agent", "")), str(args.get("task", ""))
+        if _truthy(args.get("background")):
+            from . import tasks  # tasks imports this module
+            return tasks.start(state, agent_name, task)
+        screen.set_status(f"{agent_name or 'agent'} working")
+        return _clip(run_agent(state, agent_name, task))
+    if name == "goal_complete" and state.goal:
+        state.goal = None
+        state.goal_result = (str(args.get("summary", "")), _truthy(args.get("blocked")))
+        return "Goal closed. Give the user a short final summary."
     if mcp.owner(name):
         return _clip(mcp.call(name, args))
     return execute_tool(name, args)
@@ -326,7 +394,8 @@ def agent_loop(state):
             return reply["content"]
         for call in calls:
             run_tool_call(state, call)
-    out(yellow(f"Stopped after {MAX_STEPS} model calls in one turn. Send a message to continue."))
+    if not state.background:
+        out(yellow(f"Stopped after {MAX_STEPS} model calls in one turn. Send a message to continue."))
     return f"(stopped after {MAX_STEPS} model calls without finishing)"
 
 

@@ -362,6 +362,125 @@ def test_run_agent_subloop():
     assert "Error: no agent named 'nope'" in agent.run_agent(parent, "nope", "x")
 
 
+def test_schedule_parsing_and_timing():
+    from ollama_code import schedule
+    now = 1_000_000.0
+    assert schedule.parse_duration("1h30m") == 5400 and schedule.parse_duration("soon") is None
+    assert schedule.parse_schedule("in 10m run tests", now) == (now + 600, None, "run tests")
+    assert schedule.parse_schedule("every 2s ping", now)[1] == schedule.MIN_INTERVAL  # clamped
+    due, every, prompt = schedule.parse_schedule("at 9:15pm sum up", now)
+    assert every is None and prompt == "sum up" and 0 < due - now <= 86400
+    assert time.localtime(due).tm_hour == 21 and time.localtime(due).tm_min == 15
+    for bad in ("in 10m", "at 25:00 x", "tomorrow x"):
+        try:
+            schedule.parse_schedule(bad, now)
+            raise AssertionError(bad)
+        except ValueError:
+            pass
+    assert schedule.parse_loop("5m check build", now) == (now, 300, "check build")
+    assert schedule.parse_loop("check build", now) == (now, schedule.DEFAULT_LOOP, "check build")
+    saved = list(schedule.jobs)
+    schedule.jobs.clear()
+    try:
+        loop = schedule.add(now, 300, "check", kind="loop")
+        once = schedule.add(now + 60, None, "later")
+        assert schedule.take_due(now) == [loop] and loop.due == now + 300   # loop moves to its next slot
+        assert schedule.take_due(now + 1000) == [once, loop]                 # missed slots run once, not 3x
+        assert once not in schedule.jobs and loop.due == now + 1200
+        assert schedule.cancel("all", kind="loop") == 1 and not schedule.jobs
+    finally:
+        schedule.jobs[:] = saved
+
+
+def _scripted(replies):
+    """A stand-in for agent.model_reply that answers from a list, recording each request's tools."""
+    script, seen = iter(replies), []
+
+    def fake(state):
+        seen.append([s["function"]["name"] for s in agent.tool_schemas(state)])
+        return next(script), {}
+    return fake, seen
+
+
+def _call(name, **args):
+    return {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": name, "arguments": args}}]}
+
+
+def test_background_agent():
+    from ollama_code import extensions, tasks
+    saved = agent.model_reply, dict(extensions.agents)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "scout.md"
+        path.write_text("---\nname: scout\n---\nYou scout.\n")
+        extensions.agents["scout"] = {"name": "scout", "description": "", "path": path, "tools": ""}
+        try:
+            agent.model_reply, _ = _scripted([_call("run_command", command="echo hi"),
+                                              {"role": "assistant", "content": "Found 3 things."}])
+            parent = agent.State("m", "http://x", 0, True, True, yolo=False)
+            started = agent.call_tool(parent, "run_agent", {"agent": "scout", "task": "look", "background": True})
+            assert started.startswith("Started background task #")
+            job = list(tasks.tasks.values())[-1]
+            for _ in range(100):
+                if job.status != "running":
+                    break
+                time.sleep(0.05)
+            assert job.status == "done" and job.report == "Found 3 things."
+            assert tasks.has_finished() and tasks.take_finished() == [job] and not tasks.has_finished()
+            assert "Found 3 things." in tasks.notice(job) and len(parent.messages) == 1  # parent untouched
+            child = agent.make_subagent(parent, "scout", "x")
+            child.background = threading.Event()
+            assert "needs the user's approval" in agent.background_tool(child, "run_command", {"command": "x"})
+            assert agent.background_tool(child, "list_files", {"pattern": "*.nothing"}) == "No files matched."
+        finally:
+            agent.model_reply = saved[0]
+            extensions.agents.clear()
+            extensions.agents.update(saved[1])
+
+
+def test_goal_runs_until_complete():
+    from ollama_code import automation
+    saved = agent.model_reply
+    try:
+        agent.model_reply, seen = _scripted([
+            {"role": "assistant", "content": "Did part one."},                    # round 1: not done yet
+            _call("goal_complete", summary="All tests pass."),                    # round 2: done
+            {"role": "assistant", "content": "Finished."}])
+        state = agent.State("m", "http://x", 0, True, True, yolo=True)
+        rounds = []
+
+        def run_prompt(s, text):
+            rounds.append(text)
+            agent.run_turn(s, text)
+            return True
+
+        automation.goal_command(state, "make the tests pass", run_prompt)
+    finally:
+        agent.model_reply = saved
+    assert len(rounds) == 2 and rounds[0].startswith("New goal") and "Round 2" in rounds[1]
+    assert "goal_complete" in seen[0] and state.goal is None
+    assert state.goal_result == ("All tests pass.", False)
+
+
+def test_prompt_wakes_for_background_work():
+    from contextlib import nullcontext
+    from ollama_code import lineedit
+    saved = lineedit.AVAILABLE, lineedit._key_ready, lineedit._raw_mode, lineedit._windows_keys, lineedit._unix_keys
+    real_stdout = sys.stdout
+    try:
+        lineedit.AVAILABLE, lineedit._raw_mode, sys.stdout = True, nullcontext, io.StringIO()
+        lineedit._key_ready = lambda timeout: False   # nobody is typing
+        lineedit._windows_keys = lineedit._unix_keys = lambda: iter(())
+        try:
+            lineedit.read_line("> ", lambda b, p: lineedit.NONE, wake=lambda: True)
+            raise AssertionError("should have woken up")
+        except lineedit.Wake:
+            pass
+    finally:
+        sys.stdout = real_stdout
+        (lineedit.AVAILABLE, lineedit._key_ready, lineedit._raw_mode,
+         lineedit._windows_keys, lineedit._unix_keys) = saved
+
+
 FAKE_MCP_SERVER = r'''
 import json, sys
 for line in sys.stdin:

@@ -109,7 +109,10 @@ def schemas():
     if agents:
         out.append(_schema("run_agent", "Run a specialist agent on a task and get its final report back.",
                            {"agent": {"type": "string", "description": "Agent name (see the Agents list)"},
-                            "task": {"type": "string", "description": "Complete, self-contained instructions"}},
+                            "task": {"type": "string", "description": "Complete, self-contained instructions"},
+                            "background": {"type": "boolean", "description":
+                                           "Run it in the background and carry on; its report arrives later "
+                                           "as a message. Use for long, independent work."}},
                            ["agent", "task"]))
     return out
 

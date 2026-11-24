@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .terminal import (ACCENT, COLOR, TTY, bold, cyan, dim, gradient, green, out, red, rgb,
                        screen, shimmer, visible_len, yellow)
-from . import extensions, lineedit, mcp
+from . import automation, extensions, lineedit, mcp, schedule, tasks
 from .attach import attachments, match_files, project_files
 from .lineedit import Suggestions
 from .tools import (_clip, run_command)
@@ -32,6 +32,10 @@ COMMANDS = [  # (command, arguments, what it does): drives /help and the live su
     ("/mcp", "", "list MCP servers and their tools"),
     ("/skills", "", "list the Claude Code skills found (run one with /<skill> [request])"),
     ("/agents", "", "list the Claude Code agents the model can delegate to"),
+    ("/tasks", "[stop n|all]", "background agents: list them, or stop one"),
+    ("/goal", "<objective>", "keep working until the objective is done (/goal clear, /goal continue)"),
+    ("/loop", "[interval] <prompt>", "repeat a prompt now and every interval, default 10m (/loop stop)"),
+    ("/schedule", "in|at|every <when> <prompt>", "run a prompt later, e.g. at 9am (/schedule cancel n|all)"),
     ("/think", "", "toggle showing the model's reasoning (shown by default)"),
     ("/yolo", "", "toggle asking before edits and commands"),
     ("/exit", "", "quit (also Ctrl+D, or Ctrl+Z then Enter on Windows)"),
@@ -113,6 +117,14 @@ def handle_command(state, text):
             out(dim(f"None found in .claude/{cmd[1:]}, {extensions.CLAUDE_HOME / cmd[1:]} or enabled plugins."))
         for name, item in table.items():
             out(f"  {bold(name)}  " + dim(item["description"][:100]))
+    elif cmd == "/loop":
+        automation.loop_command(arg)
+    elif cmd == "/schedule":
+        automation.schedule_command(arg)
+    elif cmd == "/tasks":
+        automation.tasks_command(arg)
+    elif cmd == "/goal":
+        automation.goal_command(state, arg, run_prompt)
     else:
         out(yellow(f"Unknown command {cmd}. Type /help for the list."))
     return True
@@ -143,11 +155,16 @@ def with_files(prompt):
     return files
 
 
+def work_waiting():
+    return schedule.has_due() or tasks.has_finished()
+
+
 def read_prompt():
     lines, suggest = [], Suggester()
     while True:
+        wake = None if lines else work_waiting  # never interrupt a half-typed multi-line prompt
         line = screen.ask(rgb("❯ ", ACCENT[0], "1;") if not lines else dim("┊ "),
-                          reader=lambda prompt: lineedit.read_line(prompt, suggest))
+                          reader=lambda prompt: lineedit.read_line(prompt, suggest, wake))
         if line.endswith("\\"):
             lines.append(line[:-1])
             continue
@@ -244,13 +261,52 @@ def banner(state):
     out()
 
 
+def run_prompt(state, text, files=()):
+    """One model turn with the usual footer. False if it was interrupted or failed."""
+    ok = guarded(state, lambda: run_turn(state, text, files))
+    if ok:
+        footer(state)
+    out()
+    return ok
+
+
+def process(state, text):
+    """Handle one line of input: a skill, a /command, a !shell command or a prompt. False means quit."""
+    if text.startswith("/") and skill_request(text):
+        out(dim(f"  ⎿  Running skill {text.split()[0][1:]}"))
+        return run_prompt(state, skill_request(text)) or True
+    if text.startswith("/"):
+        return handle_command(state, text) is not False
+    if text.startswith("!"):
+        run_bang(state, text[1:].strip())
+        return True
+    run_prompt(state, text, with_files(text))
+    return True
+
+
+def run_due_work(state):
+    """Run scheduled jobs and hand finished background reports to the model. False means quit."""
+    for header, prompt, from_user in automation.due_work():
+        out(header)
+        if from_user:
+            if not process(state, prompt):
+                return False
+        else:
+            run_prompt(state, prompt)
+    return True
+
+
 def repl(state):
     banner(state)
     ctrl_c_once = False
     while True:
+        if not run_due_work(state):
+            return
         try:
             text = read_prompt()
             ctrl_c_once = False
+        except lineedit.Wake:
+            continue
         except EOFError:
             out()
             return
@@ -261,22 +317,8 @@ def repl(state):
             ctrl_c_once = True
             out(dim("\n(press Ctrl+C again or type /exit to quit)"))
             continue
-        if not text:
-            continue
-        if text.startswith("/") and skill_request(text):
-            out(dim(f"  ⎿  Running skill {text.split()[0][1:]}"))
-            text = skill_request(text)
-        elif text.startswith("/"):
-            if handle_command(state, text) is False:
-                return
-            continue
-        if text.startswith("!"):
-            run_bang(state, text[1:].strip())
-            continue
-        files = with_files(text)
-        if guarded(state, lambda: run_turn(state, text, files)):
-            footer(state)
-        out()
+        if text and not process(state, text):
+            return
 
 
 def main(argv=None):
@@ -321,6 +363,13 @@ def main(argv=None):
         if not guarded(state, lambda: run_turn(state, args.prompt, files)):
             return 1
         footer(state)
+        while any(t.status == "running" for t in tasks.tasks.values()):  # -p waits for background agents
+            screen.set_status("Waiting for background agents")
+            time.sleep(0.2)
+        screen.set_status(None)
+        for _header, prompt, _from_user in automation.due_work():  # only task reports: -p has no schedules
+            if not run_prompt(state, prompt):
+                return 1
         return 0
     repl(state)
     return 0
