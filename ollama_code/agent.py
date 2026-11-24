@@ -236,12 +236,13 @@ def show_thinking_text(text):
     out(faint(text.replace("\n", "\n" + GUTTER)), end="")
 
 
-def _stream_reply(state):
+def _stream_reply(state, options=None, think=None):
     messages = state.messages + ([AUTO_NOTE] if state.auto else [])  # a reminder, never saved to history
     payload = {"model": state.model, "messages": messages, "tools": tool_schemas(state),
-               "stream": True, "think": state.think}
-    if state.ctx:
-        payload["options"] = {"num_ctx": state.ctx}
+               "stream": True, "think": state.think if think is None else think}
+    options = {**({"num_ctx": state.ctx} if state.ctx else {}), **(options or {})}
+    if options:
+        payload["options"] = options
     if state.background:
         return _read_quietly(state, payload)
     loaded = loaded_model(state)
@@ -332,14 +333,36 @@ def _read_stream(state, payload, started):
     return reply, stats
 
 
+# Ollama aborts a reply once the same token comes out 100+ times in a row (whitespace counts as one
+# token), i.e. the model is stuck in a loop. Each retry pushes harder against repetition; the last one
+# also skips the thinking step, where small models loop most.
+LOOP_RETRIES = [
+    ({"repeat_penalty": 1.15, "repeat_last_n": 256, "temperature": 0.9}, None),
+    ({"repeat_penalty": 1.3, "repeat_last_n": 512, "temperature": 1.0}, False),
+]
+
+
 def model_reply(state):
     try:
         return _stream_reply(state)
     except OllamaError as e:
-        if state.think and "think" in str(e).lower():  # model without thinking support: retry without it
-            state.think = False
+        if state.think and "think" in str(e).lower() and "repeat" not in str(e).lower():
+            state.think = False  # model without thinking support: retry without it
             return _stream_reply(state)
-        raise
+        if "repeat limit" not in str(e).lower():
+            raise
+    for attempt, (options, think) in enumerate(LOOP_RETRIES, 1):
+        if not state.background:
+            new_line()
+            out(yellow(f"  ↻ The model got stuck repeating itself; retrying with a repetition penalty"
+                       + (" and without thinking" if think is False else "") + f" ({attempt}/{len(LOOP_RETRIES)})"))
+        try:
+            return _stream_reply(state, options, think)
+        except OllamaError as e:
+            if "repeat limit" not in str(e).lower():
+                raise
+    raise OllamaError("The model kept repeating itself, even with a repetition penalty. Try rephrasing, "
+                      "/compact (long contexts make small models loop more), or a larger model with /model.")
 
 
 def run_tool_call(state, call):

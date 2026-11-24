@@ -61,19 +61,26 @@ class ModeSwitch(Exception):
         self.text = text
 
 
-class EscWatcher:
-    """While the model works: Esc stops the turn (as Ctrl+C does), and anything else typed is kept
-    as type-ahead for the next prompt. Prompts that need the keyboard (approvals) pause it."""
+QUEUE_COLOR = (150, 150, 165)
 
-    def __init__(self):
+
+class EscWatcher:
+    """While the model works, the input box stays docked at the bottom of the screen: what you type
+    shows there, Enter queues it (queued messages run in order once the turn ends), Esc stops the
+    turn as Ctrl+C does. Unsent text becomes type-ahead for the next prompt. Prompts that need the
+    keyboard (approvals) pause it."""
+
+    def __init__(self, queue=None):
         self.fired, self.typed = False, ""
+        self.queue = queue if queue is not None else []  # shared with the REPL, which runs them in order
         self._stop, self._pause, self._lock = threading.Event(), threading.Event(), threading.Lock()
-        self._saved, self._thread = None, None
+        self._saved, self._thread, self._docked = None, None, False
 
     def __enter__(self):
         if AVAILABLE:
             self._keys_mode()
             screen.pause_keys = self.paused
+            self._docked = screen.dock(self.render)
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
         return self
@@ -83,8 +90,22 @@ class EscWatcher:
             self._stop.set()
             self._thread.join(1)
             screen.pause_keys = None
+            if self._docked:
+                screen.undock()
             self._normal_mode()
         return False
+
+    def render(self, width):
+        """The docked box: a rule with the queue, and the input line with a block cursor."""
+        if self.queue:
+            nxt = " ".join(self.queue[0].split())
+            info = f" {len(self.queue)} queued · next: {nxt[:max(10, width - 60)]} "
+        else:
+            info = " Enter queues a message · Esc interrupts "
+        rule = dim("─" * 2 + info + "─" * max(0, width - len(info) - 3))
+        room = max(10, width - 4)
+        text = self.typed[-room:]
+        return [rule, rgb("❯ ", ACCENT[0], "1;") + text + "\033[7m \033[0m"]
 
     @contextlib.contextmanager
     def paused(self):
@@ -137,13 +158,27 @@ class EscWatcher:
                 if self._pause.is_set() or not _key_ready(0.1):
                     continue
                 key = self._read_key()
-            if key == "esc" and not self.fired:
-                self.fired = True
-                _thread.interrupt_main()  # same path as Ctrl+C: the turn stops, the stream hangs up
-            elif key in ("\x08", "\x7f"):
-                self.typed = self.typed[:-1]
-            elif len(key) == 1 and key.isprintable():  # not "esc" again, nor a pasted control sequence
-                self.typed += key
+            if key == "esc":
+                if not self.fired:
+                    self.fired = True
+                    _thread.interrupt_main()  # same path as Ctrl+C: the turn stops, the stream hangs up
+                continue
+            for ch in key:  # a paste can arrive as several characters at once
+                self._edit(ch)
+            if self._docked:
+                screen.refresh_box()
+
+    def _edit(self, ch):
+        if ch in ("\r", "\n"):
+            if self.typed.strip():
+                self.queue.append(self.typed.strip())
+            self.typed = ""
+        elif ch in ("\x08", "\x7f"):
+            self.typed = self.typed[:-1]
+        elif ch == "\x15":  # Ctrl+U clears the line
+            self.typed = ""
+        elif ch.isprintable():
+            self.typed += ch
 
 
 def _unix_keys():

@@ -169,6 +169,7 @@ def work_waiting():
 
 AUTO_COLOR = (255, 170, 60)
 typeahead = ""  # what was typed while the model worked, waiting for the next prompt
+queued = []     # messages sent (Enter) while the model worked; they run in order after the turn
 
 
 def prompt_marker(state):
@@ -325,12 +326,15 @@ def run_prompt(state, text, files=()):
     """One model turn with the usual footer. False if it was interrupted (Esc / Ctrl+C) or failed."""
     global typeahead
     try:
-        with lineedit.EscWatcher() as keys:
+        with lineedit.EscWatcher(queue=queued) as keys:
             ok = guarded(state, lambda: run_turn(state, text, files))
     except KeyboardInterrupt:  # an Esc that landed just after the turn ended: nothing left to stop
         ok = False
     typeahead += keys.typed
     if keys.fired:
+        if queued:  # you stopped it, so don't fire off what you'd lined up: hand it back for editing
+            typeahead = " ".join(queued + ([typeahead] if typeahead else []))
+            queued.clear()
         out(dim("  ⎿  Stopped with Esc. Type what to do instead, or carry on."))
     if ok:
         footer(state)
@@ -376,6 +380,14 @@ def repl(state):
     while True:
         if not run_due_work(state):
             return
+        if queued:  # what you sent while the model was busy, oldest first, as if typed now
+            text = queued.pop(0)
+            out(prompt_marker(state) + text + (dim(f"   ({len(queued)} more queued)") if queued else ""))
+            lineedit.history.append(text)
+            state.inputs.append(text)
+            if not process(state, text):
+                return
+            continue
         try:
             text = read_prompt(state)
             ctrl_c_once = False

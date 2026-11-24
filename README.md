@@ -73,7 +73,8 @@ ollama-code --yolo -p "fix the failing test in tests/test_api.py"
 | `!command` | Run a shell command yourself; output goes into the conversation |
 | `@path` | Attach a file. Type `@` for suggestions, or drag a file into the terminal (absolute paths attach too). Images go to vision models |
 | line ending in `\` | Continue typing on the next line |
-| Esc or Ctrl+C | Stop the current response (and the command it's running). Keys typed while the model works wait at the next prompt |
+| Typing while the model works | The input box stays at the bottom of the screen. Enter queues the message; queued messages run in order when the current turn ends. Unsent text waits at the next prompt |
+| Esc or Ctrl+C | Stop the current response (and the command it's running). Queued messages come back to the prompt for editing instead of running |
 | Shift+Tab, `/auto` | Switch auto mode on/off. The prompt shows `⏵⏵ auto` while it's on |
 
 Typing `/` shows matching commands as you type (arrows to pick, Tab to complete, Enter to run, Esc to hide).

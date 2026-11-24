@@ -136,6 +136,7 @@ class Screen:
         self.step_tokens, self.step_first, self.step_last = 0, 0.0, 0.0  # for the live tok/s
         self.live = live
         self.pause_keys = None          # set by the Esc watcher: a context that hands the keyboard back
+        self.box, self.box_rows, self.box_screen_rows = None, 0, 0  # docked input box, see dock()
         self.pinned = None              # label of an animated header line above the cursor, e.g. "Thinking"
         self.pin_start = 0.0
         self.rows_below = self.col = 0  # rows printed since the pinned header, and the cursor column
@@ -182,8 +183,57 @@ class Screen:
 
     def _draw_pinned(self, text):
         up = self.rows_below + 1
-        if up < shutil.get_terminal_size((80, 20)).lines:  # header still on screen, not scrolled away
+        if up < shutil.get_terminal_size((80, 20)).lines - self.box_rows:  # still on screen, not scrolled away
             sys.stdout.write(f"\0337\033[{up}A\r\033[K{text}\0338")  # save cursor, jump up, redraw, restore
+
+    # --- the docked input box: shown at the bottom while the model works ---------------------------
+    BOX_ROWS = 2  # a status rule and the input line
+
+    def dock(self, render):
+        """Keep the bottom rows for an input box: output scrolls above it (a terminal scroll region),
+        the box stays put. `render(width)` returns the box's lines. False if the terminal is too small."""
+        rows = shutil.get_terminal_size((80, 24)).lines
+        if not self.live or rows < 10:
+            return False
+        with self.lock:
+            self._erase()
+            if not self.line_start:
+                sys.stdout.write("\n")
+                self.line_start = True
+            n = self.BOX_ROWS
+            # make room so the cursor isn't inside the box, then fence the box off; DECSTBM homes the
+            # cursor, hence the save/restore around it
+            sys.stdout.write("\n" * n + f"\033[{n}A\0337\033[1;{rows - n}r\0338")
+            self.box, self.box_rows, self.box_screen_rows = render, n, rows
+            self._draw_box()
+            sys.stdout.flush()
+        return True
+
+    def undock(self):
+        with self.lock:
+            if not self.box:
+                return
+            self._erase()
+            rows = self.box_screen_rows
+            sys.stdout.write(f"\0337\033[r\0338\0337\033[{rows - self.box_rows + 1};1H\033[J\0338")
+            self.box, self.box_rows = None, 0
+            sys.stdout.flush()
+
+    def refresh_box(self):
+        with self.lock:
+            self._draw_box()
+            sys.stdout.flush()
+
+    def _draw_box(self):
+        if not self.box:
+            return
+        size = shutil.get_terminal_size((80, 24))
+        if size.lines != self.box_screen_rows:  # window resized: move the fence
+            self.box_screen_rows = size.lines
+            sys.stdout.write(f"\0337\033[1;{size.lines - self.box_rows}r\0338")
+        lines = self.box(size.columns)
+        sys.stdout.write("\0337" + "".join(f"\033[{size.lines - self.box_rows + 1 + i};1H\033[2K{line}"
+                                           for i, line in enumerate(lines[:self.box_rows])) + "\0338")
 
     def pinned_frame(self, frame):
         spin = self.FRAMES[(frame // 2) % len(self.FRAMES)]
@@ -250,6 +300,9 @@ class Screen:
         with self.lock:
             if self.pinned:
                 self._draw_pinned(self.pinned_frame(frame))
+                sys.stdout.flush()
+            if self.box and frame % 8 == 0:  # twice a second: follow window resizes, refresh the box
+                self._draw_box()
                 sys.stdout.flush()
             idle = time.monotonic() - self.last_write
             if self.status is None or idle < 0.5 or (not self.line_start and idle < 2):

@@ -619,6 +619,112 @@ def test_esc_stops_the_turn_and_keeps_typeahead():
          lineedit.EscWatcher._keys_mode, lineedit.EscWatcher._normal_mode) = saved
 
 
+def test_input_box_queues_messages():
+    from ollama_code import lineedit
+    saved = (lineedit.AVAILABLE, lineedit._key_ready, lineedit.EscWatcher._read_key,
+             lineedit.EscWatcher._keys_mode, lineedit.EscWatcher._normal_mode, sys.stdout)
+    saved_env = {k: os.environ.get(k) for k in ("LINES", "COLUMNS")}
+    keys = iter(["r", "u", "n", " ", "t", "e", "s", "t", "s", "\r",   # typed, then Enter: queued
+                 "fix it\nand", "\r",                                 # a paste: one more queued, then "and"
+                 "x", "esc"])                                          # unsent text, then Esc
+    queue, buf = ["earlier one"], io.StringIO()
+    try:
+        os.environ.update(LINES="30", COLUMNS="80")
+        sys.stdout = buf
+        terminal.screen.live = True
+        lineedit.AVAILABLE = True
+        lineedit._key_ready = lambda timeout: time.sleep(0.02) or True
+        lineedit.EscWatcher._read_key = lambda self: next(keys, "")
+        lineedit.EscWatcher._keys_mode = lineedit.EscWatcher._normal_mode = lambda self: None
+        try:
+            with lineedit.EscWatcher(queue=queue) as w:
+                assert terminal.screen.box is not None   # box docked while the model works
+                time.sleep(5)
+            raise AssertionError("Esc didn't interrupt")
+        except KeyboardInterrupt:
+            pass
+    finally:
+        (lineedit.AVAILABLE, lineedit._key_ready, lineedit.EscWatcher._read_key,
+         lineedit.EscWatcher._keys_mode, lineedit.EscWatcher._normal_mode, sys.stdout) = saved
+        terminal.screen.live = terminal.TTY
+        for k, v in saved_env.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    assert queue == ["earlier one", "run tests", "fix it", "and"] and w.typed == "x"
+    screen_bytes = buf.getvalue()
+    assert "\033[1;28r" in screen_bytes          # output scrolls in rows 1-28; the box owns 29-30
+    assert "\033[29;1H" in screen_bytes and "\033[30;1H" in screen_bytes and "queued" in screen_bytes
+    assert screen_bytes.rstrip().endswith("\0338") and "\033[r" in screen_bytes  # fence removed at the end
+    assert terminal.screen.box is None
+    w2 = lineedit.EscWatcher(queue=["a very long next message"])
+    rule, line = w2.render(60)
+    assert "1 queued · next: a very" in rule and line.endswith("\033[7m \033[0m")
+
+
+def test_repl_runs_queued_messages_in_order():
+    ran, saved = [], (cli.process, cli.read_prompt, cli.banner, cli.run_due_work)
+    state = agent.State("m", "http://x", 0, True, True, yolo=False)
+
+    def fake_process(s, text):
+        ran.append(text)
+        if text == "first":
+            cli.queued.append("third")  # sent while "first" was running
+        return True
+
+    def fake_read_prompt(s):
+        ran.append("<prompt>")
+        raise EOFError
+
+    try:
+        cli.process, cli.read_prompt = fake_process, fake_read_prompt
+        cli.banner, cli.run_due_work = (lambda s: None), (lambda s: True)
+        cli.queued[:] = ["first", "second"]
+        cli.repl(state)
+    finally:
+        cli.process, cli.read_prompt, cli.banner, cli.run_due_work = saved
+        cli.queued.clear()
+    assert ran == ["first", "second", "third", "<prompt>"]  # all queued work, in order, before the prompt
+    assert state.inputs == ["first", "second", "third"]    # and they're in the session's ↑ history
+
+
+def test_repeat_loop_is_retried():
+    sent, saved = [], agent.stream_chat
+    loops = 2  # the model loops twice, then behaves
+
+    def fake_stream(host, payload):
+        sent.append(payload)
+        if len(sent) <= loops:
+            raise client.OllamaError("prediction aborted, token repeat limit reached")
+        yield {"message": {"role": "assistant", "content": "fixed"}, "done": True}
+
+    state = agent.State("m", "http://x", 4096, True, False, yolo=False)
+    real, buf = sys.stdout, io.StringIO()
+    try:
+        agent.stream_chat, sys.stdout = fake_stream, buf
+        reply, _ = agent.model_reply(state)
+        plain, retry1, retry2 = sent
+        assert "options" in plain and "repeat_penalty" not in plain["options"]   # normal turns untouched
+        assert retry1["options"]["num_ctx"] == 4096 and retry1["options"]["repeat_penalty"] == 1.15
+        assert retry1["think"] is True and retry2["think"] is False
+        loops = 99  # now it never stops looping: a clear error, not a crash
+        sent.clear()
+        try:
+            agent.model_reply(state)
+            raise AssertionError("should give up")
+        except client.OllamaError as e:
+            assert "kept repeating itself" in str(e) and len(sent) == 3
+    finally:
+        agent.stream_chat, sys.stdout = saved, real
+    assert reply["content"] == "fixed"
+    assert state.think is True  # retries never switch thinking off for good
+    assert "↻ The model got stuck repeating itself" in buf.getvalue()
+
+
+def test_repeat_retry_settings():
+    first, second = agent.LOOP_RETRIES
+    assert first[0]["repeat_penalty"] > 1 and first[1] is None   # 1st retry: penalty, thinking as usual
+    assert second[0]["repeat_penalty"] > first[0]["repeat_penalty"] and second[1] is False  # 2nd: no thinking
+
+
 def test_shift_tab_and_auto_mode():
     from contextlib import nullcontext
     from ollama_code import lineedit
